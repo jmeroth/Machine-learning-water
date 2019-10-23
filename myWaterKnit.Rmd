@@ -1,0 +1,283 @@
+---
+title: "Regression Analysis of Water Systems"
+author: "John Meroth"
+date: "`r Sys.Date()`"
+output:
+  word_document: default
+  pdf_document: default
+  html_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+## DRINKING WATER VIOLATIONS
+
+The following logistic regression analysis in R estimates the probability of a violation occurring based upon the chosen feature vectors.  For most choices, it is believed that no correlation will be seen (ROC plot a straight line).  In the event a collection of useful features are discovered, the AUC of the ROC plot will increase and the associated model may prove useful in highlighting at-risk water systems.
+
+Notes:  
+Sparse data exists prior to 2008, therefore we use data from 2008 and later.  
+Only data from currently "Active" water systems are considered.  
+Although some systems report violations quarterly, some report only annually.
+
+## ORGANIZING TEST DATA
+
+The EPA's SDWIS tables WATER_SYSTEM, VIOLATION, and WATER_SYSTEM_FACILITY can be used to generate a set of labelled test data.  Each record, identified by "PWSID" represents a water system in the United States.  
+
+### Setup the environment
+```{r echo=TRUE, message=FALSE, warning=FALSE}
+library(dplyr)
+library(dummies)
+library(readr)
+library(tidyverse)
+library(pROC)
+library(lubridate)
+library(effects)
+```
+
+### Import data from pwsid.csv
+This file was created by querying the WATER_SYSTEM table for all active water systems.  
+`SQL code:
+    SELECT PWSID
+    FROM WATER_SYSTEM
+    WHERE PWS_ACTIVITY_CODE = 'A'`
+```{r}
+getwd()
+setwd('C:/Users/jmeroth/WATER/derived')
+df <- read_csv("pwsid.csv")
+summary(df)
+```
+
+### Import data from vHealth.csv
+This file was created by filtering the VIOLATION table for health-based violations.  
+`SQL code:
+    SELECT
+    PWSID
+    , cast(VIOLATION_ID AS TEXT) VIOLATION_ID
+    , COMPL_PER_BEGIN_DATE
+    FROM VIOLATION
+    WHERE
+    IS_HEALTH_BASED_IND = "Y"`
+```{r}
+setwd('C:/Users/jmeroth/WATER/derived')
+vH <- read_csv("vHealth.csv", col_names = TRUE, cols(VIOLATION_ID = "c"))
+summary(vH)
+```
+
+Convert character field to date:
+```{r}
+vH <- vH %>% mutate(COMPL_PER_BEGIN_DATE = as.Date(COMPL_PER_BEGIN_DATE, format = "%d-%B-%y"))
+str(vH)
+
+```
+
+Create label field "H_viol_2017" from health violation data:
+```{r}
+vH <- vH %>% 
+  filter(year(vH$COMPL_PER_BEGIN_DATE) == 2017) %>%
+  group_by(PWSID) %>%
+  summarise(H_viol_2017 = 1)
+head(vH)
+```
+
+
+Merge data into df forming the test data set:
+```{r}
+df <- merge(df, vH, by.x="PWSID", by.y="PWSID", all.x=TRUE)
+df[is.na(df)] <- 0
+summary(df)
+```
+
+## FEATURE ENGINEERING
+
+"Features" are characteristics or measurments of each sample in our data set.  A good feature will be somehow related to the chances of a system registering a violation.  The exact relationship to a violation need not be know for the feature to be useful.
+
+### TREATED_SOURCE
+
+Add a binary predictor variable, "TREATED_SOURCE" (1 if treatment facility exists).
+The file treated_source.csv was created using this SQL code:  
+    with active_facilities AS (
+    select ws.PWSID
+    from WATER_SYSTEM2 ws left join WATER_SYSTEM_FACILITY_3 fa
+    on ws.PWSID = fa.PWSID
+    where ws.PWS_ACTIVITY_CODE = 'A'
+    and fa.IS_SOURCE_TREATED_IND = 'Y'
+    and fa.FACILITY_ACTIVITY_CODE = 'A')
+    Select DISTINCT PWSID from active_facilities
+
+```{r}
+setwd("C:/Users/jmeroth/water/derived")
+treated_source <- read_csv("treated_source.csv")
+treated_source$TREATED_SOURCE = 1
+df <- merge(df, treated_source, by.x="PWSID", by.y="PWSID"
+		, all.x=TRUE)
+df[is.na(df)] <- 0
+```
+
+
+### VIOLATION_CATEGORY_CODE
+
+Add a group of variables indicating the occurrance of a non-health violation in the prior year (2016).
+The file violation_category_code.csv was created using this SQL code:  
+    SELECT
+    PWSID, VIOLATION_CATEGORY_CODE, substr(COMPL_PER_BEGIN_DATE, -2) AS vYear
+    FROM VIOLATION2
+    WHERE
+    IS_HEALTH_BASED_IND = "N"
+    and PWS_ACTIVITY_CODE = 'A'
+    and vYear = '16'
+    GROUP by PWSID, VIOLATION_CATEGORY_CODE, vYear  
+The resulting records were pivoted by PWSID on VIOLATION_CATEGORY_CODE.
+
+```{r}
+setwd("C:/Users/jmeroth/water/derived")
+violation_category_code <- read_csv("violation_category_code.csv")
+df <- merge(df, violation_category_code, by.x="PWSID", by.y="PWSID"
+		, all.x=TRUE)
+df[is.na(df)] <- 0
+```
+
+
+### PRIMARY_SOURCE_CODE
+
+The file primary_source_code.csv was created using this SQL code:  
+    SELECT PWSID, PRIMARY_SOURCE_CODE
+    FROM WATER_SYSTEM
+    WHERE PWS_ACTIVITY_CODE = 'A'
+    
+Add a categorical variable "PRIMARY_SOURCE_CODE":
+```{r}
+setwd("C:/Users/jmeroth/water/derived")
+psc <- read_csv("primary_source_code.csv")
+# Merge the new feature vector:
+df <- merge(df, psc, by.x="PWSID", by.y="PWSID", all.x=TRUE)
+# Convert empty cells to zero:
+df[is.na(df)] <- 0
+
+```
+
+
+### PWS_TYPE_CODE
+
+The file pws_type_code.csv was created using this SQL code:  
+    *SELECT PWSID, PWS_TYPE_CODE
+    FROM WATER_SYSTEM
+    WHERE PWS_ACTIVITY_CODE = 'A'*
+    
+Add a categorical variable "PWS_TYPE_CODE":
+```{r}
+setwd("C:/Users/jmeroth/water/derived")
+ptc <- read_csv("pws_type_code.csv")
+# Merge the new feature vector:
+df <- merge(df, ptc, by.x="PWSID", by.y="PWSID", all.x=TRUE)
+# Convert empty cells to zero:
+df[is.na(df)] <- 0
+
+```
+
+
+### PRIOR YEAR TOTAL RAINFALL
+
+The file wsAnnualRain.csv was created using the Jupyter Notebook: match_water_weather.ipynb (from Mia Polansky, June 20, 2019)
+This file contains the geolocated watersystems along with the annual rainfall at the nearest weather station.
+    
+Add a normalized, continuous variable "r2016n":
+```{r}
+# Read in the rainfall data:
+setwd("C:/Users/jmeroth/WATER/Weather")
+rain <- read_csv("wsAnnualRain.csv")
+
+# Normalize the rainfall data:
+rain$X1 <- NULL
+colnames(rain)[colnames(rain)=="0"] <- "r2016"
+rmin <- min(rain$r2016)
+rmax <- max(rain$r2016)
+rscale = rmax-rmin
+rain["r2016n"] <- (rain$r2016-rmin)/rscale  - 1.0
+rain$r2016 <- NULL
+```
+
+```{r}
+# Merge the new feature vector:
+df <- merge(df, rain, by.x="PWSID", by.y="PWSID", all.x=TRUE)
+# Convert empty cells to zero:
+df[is.na(df)] <- 0
+
+```
+
+
+## MODELLING
+
+
+### Run the Logistic Regression Model:
+
+
+```{r}
+logit <- glm(H_viol_2017 ~ TREATED_SOURCE + PRIMARY_SOURCE_CODE + PWS_TYPE_CODE + MON + MR + Other + RPT + r2016n
+ , data = df, family = "binomial")
+summary(logit)
+
+```
+
+Result of regression using the "effects" library:
+```{r}
+
+plot(effects::allEffects(logit), axes=list(grid=FALSE))
+```
+
+### Create Test Data
+```{r}
+test_data <- df
+test_data$PWSID <- NULL
+test_data$H_viol_2017 <- NULL
+```
+
+
+
+Calculate probabilities P, add to data frame.
+```{r}
+df["P"] <- predict(logit, test_data, type="response")
+```
+
+
+## ANALYSIS
+
+### Analysis of Means
+```{r}
+df %>% group_by(H_viol_2017) %>% summarise(mean = mean(P))
+```
+
+### Pivot tables
+```{r}
+xtabs(~H_viol_2017 + PRIMARY_SOURCE_CODE, data = df)
+```
+
+```{r}
+xtabs(~H_viol_2017 + PWS_TYPE_CODE, data = df)
+```
+
+### Probability Distribution
+```{r, echo=FALSE}
+hist(df$P)
+```
+
+
+### Confusion Marix with threshold set as P = 0.3
+```{r}
+df %>% group_by(P > 0.3) %>% filter(H_viol_2017 == 1) %>% summarise(n())
+df %>% group_by(P > 0.3) %>% filter(H_viol_2017 == 0) %>% summarise(n())
+```
+
+
+### ROC
+```{r message=FALSE, warning=FALSE}
+#Create a square plot
+par(pty = "s")
+roc(df$H_viol_2017, df$P, plot=TRUE, legacy.axes=TRUE, percent=FALSE, xlab="False Positive Rate", ylab="True Positive Rate", col="#377eb8", lwd=4, print.auc=TRUE)
+
+```
+
+
+## FUTURE WORK
+
+Two years of rainfall data should be included as well as demographic data.
